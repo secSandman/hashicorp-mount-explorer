@@ -19,7 +19,7 @@ This PowerShell script retrieves a list of namespaces and mount points from a Ha
 - **Target Environment Selection:**  
   Provides interactive selection of the target Vault environment from three options:
   - **1:** `https://prod.vaultserver.com`
-  - **2:** `https://int.vaultserver.com`
+  - **2:** `https://dev.vaultserver.com`
   - **3:** `https://test.vaultserver.com`
 
 ## Prerequisites
