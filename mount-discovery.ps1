@@ -1,14 +1,14 @@
 <# 
     VaultNamespacesMounts.ps1
-    This script lists all HashiCorp Vault namespaces (Vault 1.16.x) and for each namespace, lists all mount points 
-    (including auth mounts and secrets mounts). For each mount point, it writes a record into a CSV file that includes 
-    the namespace, mount path, and mount type (e.g. kv, jwt, approle, kubernetes, etc).
+    This script lists all HashiCorp Vault namespaces (Vault 1.16.x) and for each namespace, retrieves all mount points – 
+    both secret mounts (e.g. cubbyhole, kv, etc.) and auth mounts (e.g. aws, oidc, jwt, k8, approle, etc.). 
+    For each mount point, it writes a record into a CSV file that includes the namespace, mount path, and mount type.
 
     The script:
       - Checks if a .vault-token file exists and uses its content if available.
       - If no token is found or if token authentication fails, securely prompts the user for a Vault token.
       - Prompts the user to choose a target environment with three URL options.
-      - Queries the Vault API to list namespaces and mounts.
+      - Queries the Vault API to list namespaces, secret mounts, and auth mounts.
       - Exports the collected information to a timestamped CSV file named {timestamp}-{target-url}-mounts.csv.
 #>
 
@@ -30,12 +30,12 @@ function Convert-SecureStringToPlainText {
 # ----- Step 1: Select Target Environment -----
 Write-Host "Select target environment:" -ForegroundColor Cyan
 Write-Host "1: https://prod.vaultserver.com"
-Write-Host "2: https://dev.vaultserver.com"
+Write-Host "2: https://int.vaultserver.com"
 Write-Host "3: https://test.vaultserver.com"
 $envChoice = Read-Host "Enter option (1-3)"
 switch ($envChoice) {
     "1" { $vaultUrl = "https://prod.vaultserver.com" }
-    "2" { $vaultUrl = "https://dev.vaultserver.com" }
+    "2" { $vaultUrl = "https://int.vaultserver.com" }
     "3" { $vaultUrl = "https://test.vaultserver.com" }
     default {
         Write-Host "Invalid option. Exiting." -ForegroundColor Red
@@ -101,10 +101,11 @@ foreach ($ns in $namespaceList) {
     if ($ns -and $ns -ne "root") {
         $nsHeaders["X-Vault-Namespace"] = $ns
     }
+    
+    # Retrieve secret mounts
     $mountsUri = "$vaultUrl/v1/sys/mounts"
     try {
         $mountsResponse = Invoke-RestMethod -Method Get -Uri $mountsUri -Headers $nsHeaders -ErrorAction Stop
-        # According to the API docs, mounts are returned under the 'data' property
         if ($mountsResponse.data) {
             $mounts = $mountsResponse.data
         }
@@ -113,11 +114,9 @@ foreach ($ns in $namespaceList) {
         }
         foreach ($mountProperty in $mounts.PSObject.Properties) {
             try {
-                # Each property name (e.g., "cubbyhole/") is the mount name.
                 $mountPath = $mountProperty.Name.TrimEnd("/")
-                # The mount type is found in the property's value "type" field.
                 $mountType = $mountProperty.Value.type
-                Write-Host "Writing record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
+                Write-Host "Writing secret mount record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
                 $records += [pscustomobject]@{
                     Namespace = $ns
                     MountPath = $mountPath
@@ -125,12 +124,42 @@ foreach ($ns in $namespaceList) {
                 }
             }
             catch {
-                Write-Host "Error processing mount property '$($mountProperty.Name)': $_" -ForegroundColor Red
+                Write-Host "Error processing secret mount property '$($mountProperty.Name)': $_" -ForegroundColor Red
             }
         }
     }
     catch {
-        Write-Host "Error retrieving mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
+        Write-Host "Error retrieving secret mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
+    }
+
+    # Retrieve auth mounts
+    $authUri = "$vaultUrl/v1/sys/auth"
+    try {
+        $authResponse = Invoke-RestMethod -Method Get -Uri $authUri -Headers $nsHeaders -ErrorAction Stop
+        if ($authResponse.data) {
+            $authMounts = $authResponse.data
+        }
+        else {
+            $authMounts = $authResponse
+        }
+        foreach ($authProperty in $authMounts.PSObject.Properties) {
+            try {
+                $mountPath = $authProperty.Name.TrimEnd("/")
+                $mountType = $authProperty.Value.type
+                Write-Host "Writing auth mount record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
+                $records += [pscustomobject]@{
+                    Namespace = $ns
+                    MountPath = $mountPath
+                    MountType = $mountType
+                }
+            }
+            catch {
+                Write-Host "Error processing auth mount property '$($authProperty.Name)': $_" -ForegroundColor Red
+            }
+        }
+    }
+    catch {
+        Write-Host "Error retrieving auth mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
     }
 }
 
