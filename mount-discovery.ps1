@@ -6,7 +6,7 @@
 
     The script:
       - Checks if a .vault-token file exists and uses its content if available.
-      - If no token is found or if token authentication fails, securely prompts the user for the token.
+      - If no token is found or if token authentication fails, securely prompts the user for a Vault token.
       - Prompts the user to choose a target environment with three URL options.
       - Queries the Vault API to list namespaces and mounts.
       - Exports the collected information to a timestamped CSV file named {timestamp}-{target-url}-mounts.csv.
@@ -29,14 +29,14 @@ function Convert-SecureStringToPlainText {
 
 # ----- Step 1: Select Target Environment -----
 Write-Host "Select target environment:" -ForegroundColor Cyan
-Write-Host "1: https://prod.vault.company.com"
-Write-Host "2: https://dev.vault.company.com"
-Write-Host "3: https://test.vault.company.com"
+Write-Host "1: https://prod.vaultserver.com"
+Write-Host "2: https://dev.vaultserver.com"
+Write-Host "3: https://test.vaultserver.com"
 $envChoice = Read-Host "Enter option (1-3)"
 switch ($envChoice) {
-    "1" { $vaultUrl = "https://prod.vault.company.com" }
-    "2" { $vaultUrl = "https://dev.vault.company.com" }
-    "3" { $vaultUrl = "ttps://test.vault.company.com" }
+    "1" { $vaultUrl = "https://prod.vaultserver.com" }
+    "2" { $vaultUrl = "https://dev.vaultserver.com" }
+    "3" { $vaultUrl = "https://test.vaultserver.com" }
     default {
         Write-Host "Invalid option. Exiting." -ForegroundColor Red
         exit 1
@@ -104,19 +104,33 @@ foreach ($ns in $namespaceList) {
     $mountsUri = "$vaultUrl/v1/sys/mounts"
     try {
         $mountsResponse = Invoke-RestMethod -Method Get -Uri $mountsUri -Headers $nsHeaders -ErrorAction Stop
-        # The response is a hashtable; each key is a mount path and the value contains details.
-        foreach ($mountProperty in $mountsResponse.PSObject.Properties) {
-            $mountPath = $mountProperty.Name.TrimEnd("/")
-            $mountType = $mountProperty.Value.type
-            $records += [pscustomobject]@{
-                Namespace = $ns
-                MountPath = $mountPath
-                MountType = $mountType
+        # According to the API docs, mounts are returned under the 'data' property
+        if ($mountsResponse.data) {
+            $mounts = $mountsResponse.data
+        }
+        else {
+            $mounts = $mountsResponse
+        }
+        foreach ($mountProperty in $mounts.PSObject.Properties) {
+            try {
+                # Each property name (e.g., "cubbyhole/") is the mount name.
+                $mountPath = $mountProperty.Name.TrimEnd("/")
+                # The mount type is found in the property's value "type" field.
+                $mountType = $mountProperty.Value.type
+                Write-Host "Writing record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
+                $records += [pscustomobject]@{
+                    Namespace = $ns
+                    MountPath = $mountPath
+                    MountType = $mountType
+                }
+            }
+            catch {
+                Write-Host "Error processing mount property '$($mountProperty.Name)': $_" -ForegroundColor Red
             }
         }
     }
     catch {
-        Write-Host "Error retrieving mounts for namespace: $ns" -ForegroundColor Red
+        Write-Host "Error retrieving mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
     }
 }
 
@@ -129,5 +143,10 @@ $hostName = ([Uri]$vaultUrl).Host
 
 # Construct output file name as {timestamp}-{target-url}-mounts.csv
 $outputCsv = "$timestamp-$hostName-mounts.csv"
-$records | Export-Csv -Path $outputCsv -NoTypeInformation
-Write-Host "CSV file generated: $outputCsv" -ForegroundColor Cyan
+try {
+    $records | Export-Csv -Path $outputCsv -NoTypeInformation -ErrorAction Stop
+    Write-Host "CSV file generated: $outputCsv" -ForegroundColor Cyan
+}
+catch {
+    Write-Host "Error exporting CSV file: $_" -ForegroundColor Red
+}
