@@ -30,7 +30,7 @@ function Convert-SecureStringToPlainText {
 # ----- Step 1: Select Target Environment -----
 Write-Host "Select target environment:" -ForegroundColor Cyan
 Write-Host "1: https://prod.vaultserver.com"
-Write-Host "2: https://int.vaultserver.com"
+Write-Host "2: https://dev.vaultserver.com"
 Write-Host "3: https://test.vaultserver.com"
 $envChoice = Read-Host "Enter option (1-3)"
 switch ($envChoice) {
