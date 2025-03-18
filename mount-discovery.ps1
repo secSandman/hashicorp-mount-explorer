@@ -35,7 +35,7 @@ Write-Host "3: https://test.vaultserver.com"
 $envChoice = Read-Host "Enter option (1-3)"
 switch ($envChoice) {
     "1" { $vaultUrl = "https://prod.vaultserver.com" }
-    "2" { $vaultUrl = "https://int.vaultserver.com" }
+    "2" { $vaultUrl = "https://dev.vaultserver.com" }
     "3" { $vaultUrl = "https://test.vaultserver.com" }
     default {
         Write-Host "Invalid option. Exiting." -ForegroundColor Red
