@@ -12,20 +12,8 @@
       - Exports the collected information to a timestamped CSV file named {timestamp}-{target-url}-mounts.csv.
 #>
 
-# Function: Convert SecureString to plain text
-function Convert-SecureStringToPlainText {
-    param (
-        [Parameter(Mandatory = $true)]
-        [System.Security.SecureString]$SecureString
-    )
-    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-    }
-    finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-    }
-}
+
+
 
 # ----- Step 1: Select Target Environment -----
 Write-Host "Select target environment:" -ForegroundColor Cyan
@@ -43,139 +31,177 @@ switch ($envChoice) {
     }
 }
 
-# ----- Step 2: Retrieve Vault Token -----
-$tokenFile = ".vault-token"
-if (Test-Path $tokenFile) {
-    $vaultToken = Get-Content $tokenFile -Raw
-    if ([string]::IsNullOrWhiteSpace($vaultToken)) {
-        Write-Host "Token file exists but is empty."
-        $secureToken = Read-Host "Enter Vault token" -AsSecureString
-        $vaultToken = Convert-SecureStringToPlainText -SecureString $secureToken
-    }
-} else {
-    $secureToken = Read-Host "Vault token not found. Enter Vault token" -AsSecureString
-    $vaultToken = Convert-SecureStringToPlainText -SecureString $secureToken
-}
+# ----- Step 2: Collect Additional Information -----
 
-# ----- Step 3: Validate the Token -----
-$headers = @{ "X-Vault-Token" = $vaultToken }
-$healthUri = "$vaultUrl/v1/sys/health"
-try {
-    # A health check can serve as a token validation
-    $healthResponse = Invoke-RestMethod -Method Get -Uri $healthUri -Headers $headers -ErrorAction Stop
-}
-catch {
-    Write-Host "Error authenticating with provided token. Please re-enter token." -ForegroundColor Yellow
-    $secureToken = Read-Host "Enter Vault token" -AsSecureString
-    $vaultToken = Convert-SecureStringToPlainText -SecureString $secureToken
-    $headers["X-Vault-Token"] = $vaultToken
-}
 
-# ----- Step 4: Retrieve the List of Namespaces -----
-$namespaceList = @()
-$namespacesUri = "$vaultUrl/v1/sys/namespaces?list=true"
-try {
-    $nsResponse = Invoke-RestMethod -Method Get -Uri $namespacesUri -Headers $headers -ErrorAction Stop
-    if ($nsResponse.data -and $nsResponse.data.keys) {
-        $namespaceList = $nsResponse.data.keys
+$vaultNamespace = Read-Host "Enter target HashiCorp Vault namespace (e.g. 'my-namespace')"
+$awsAccount     = Read-Host "Enter target AWS account (profile name or identifier)"
+$awsRegion      = Read-Host "Enter target AWS region (e.g. 'us-east-1')"
+
+# ----- Step 3: Retrieve Vault Token -----
+
+function Get-VaultToken {
+    if (Test-Path ".vault-token") {
+        $token = Get-Content ".vault-token" | Out-String
+        Write-Host "Using token from .vault-token file."
+        return $token.Trim()
     }
     else {
-        Write-Host "No namespaces returned from API." -ForegroundColor Yellow
+        $secureToken = Read-Host "Enter your Vault token" -AsSecureString
+        $token = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+                 )
+        return $token
     }
 }
-catch {
-    Write-Host "Error retrieving namespaces. Assuming only the root namespace exists." -ForegroundColor Yellow
+
+# ----- Step 4: Validate Vault Token -----
+function Validate-VaultToken {
+    param(
+        [string]$Token,
+        [string]$VaultAddr,
+        [string]$Namespace
+    )
+    try {
+        $headers = @{
+            "X-Vault-Token"     = $Token
+            "X-Vault-Namespace" = $Namespace
+        }
+        $response = Invoke-RestMethod -Method GET `
+                      -Uri "$VaultAddr/v1/auth/token/lookup-self" `
+                      -Headers $headers
+        return $response
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 403) {
+            Write-Host "Authentication failed (403 Forbidden)."
+            return $null
+        }
+        else {
+            throw $_
+        }
+    }
 }
 
-# Always include the root namespace (represented as "root" here)
-if (-not ($namespaceList -contains "root")) {
-    $namespaceList += "root"
+$vaultToken = Get-VaultToken
+$vaultResponse = Validate-VaultToken -Token $vaultToken -VaultAddr $vaultUrl -Namespace $vaultNamespace
+
+while (-not $vaultResponse) {
+    $secureToken = Read-Host "Vault token invalid. Please enter a valid Vault token:" -AsSecureString
+    $vaultToken = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+                  )
+    $vaultResponse = Validate-VaultToken -Token $vaultToken -VaultAddr $vaultUrl -Namespace $vaultNamespace
 }
 
-# ----- Step 5: Retrieve Mounts for Each Namespace -----
-$records = @()
-foreach ($ns in $namespaceList) {
-    Write-Host "Processing namespace: $ns" -ForegroundColor Green
-    # Setup headers – if not the root namespace, add the X-Vault-Namespace header.
-    $nsHeaders = @{ "X-Vault-Token" = $vaultToken }
-    if ($ns -and $ns -ne "root") {
-        $nsHeaders["X-Vault-Namespace"] = $ns
+
+# Set default headers for subsequent Vault API calls.
+
+
+$vaultHeaders = @{
+    "X-Vault-Token"     = $vaultToken
+    "X-Vault-Namespace" = $vaultNamespace
+}
+
+# ----- Step 5: Retrieve KV Mounts ------
+
+Write-Host "Retrieving mounts from Vault..."
+$mountsResponse = Invoke-RestMethod -Method GET `
+                    -Uri "$vaultUrl/v1/sys/mounts" `
+                    -Headers $vaultHeaders
+
+$kvMounts = @()
+foreach ($mount in $mountsResponse.PSObject.Properties) {
+    if ($mount.Value.type -eq "kv") {
+        # Remove any trailing slash from the mount name.
+        $mountName = $mount.Name.TrimEnd("/")
+        $kvMounts += $mountName
+    }
+}
+
+if ($kvMounts.Count -eq 0) {
+    Write-Host "No KV mounts found in the specified namespace."
+    exit
+}
+
+# ----- Step 6: Function to Recursively Retrieve Secrets -----
+
+function Get-SecretsRecursively {
+    param(
+        [string]$VaultAddr,
+        [string]$MountPath,
+        [string]$SubPath = "",
+        [hashtable]$Headers
+    )
+    if ($SubPath -ne "") {
+        $trimmedPath = $SubPath.TrimEnd("/")
+        $uri = "$VaultAddr/v1/$MountPath/metadata/$trimmedPath?list=true"
+    }
+    else {
+        $uri = "$VaultAddr/v1/$MountPath/metadata?list=true"
+    }
+    try {
+        $response = Invoke-RestMethod -Method GET -Uri $uri -Headers $Headers
+    }
+    catch {
+        # If listing fails (e.g., no keys at this path), return an empty array.
+        return @()
+    }
+    $secrets = @()
+    foreach ($key in $response.data.keys) {
+        if ($key.EndsWith("/")) {
+            # It's a folder; call recursively.
+            $folderPath = if ($SubPath -ne "") { "$SubPath$key" } else { $key }
+            $secrets += Get-SecretsRecursively -VaultAddr $VaultAddr -MountPath $MountPath -SubPath $folderPath -Headers $Headers
+        }
+        else {
+            $secretPath = if ($SubPath -ne "") { "$SubPath$key" } else { $key }
+            $secrets += $secretPath
+        }
+    }
+    return $secrets
+}
+
+# ----- Step 7: Process Each KV Mount and Create Secrets in AWS Secrets Manager -----
+
+foreach ($mount in $kvMounts) {
+    Write-Host "`nProcessing mount: $mount"
+    
+    # Recursively get all secret keys from this mount.
+    $secretsList = Get-SecretsRecursively -VaultAddr $vaultUrl -MountPath $mount -Headers $vaultHeaders
+    if ($secretsList.Count -eq 0) {
+        Write-Host "No secrets found under mount $mount."
+        continue
     }
     
-    # Retrieve secret mounts
-    $mountsUri = "$vaultUrl/v1/sys/mounts"
-    try {
-        $mountsResponse = Invoke-RestMethod -Method Get -Uri $mountsUri -Headers $nsHeaders -ErrorAction Stop
-        if ($mountsResponse.data) {
-            $mounts = $mountsResponse.data
+    foreach ($secret in $secretsList) {
+        # Construct the AWS Secrets Manager secret name: {namespace}/{mount}/{secret-path}
+        $awsSecretName = "$vaultNamespace/$mount/$secret"
+        Write-Host "`nProcessing secret: $awsSecretName"
+        
+        # Retrieve the secret value from Vault using the KV v2 data endpoint.
+        $vaultDataUri = "$vaultUrl/v1/$mount/data/$secret"
+        try {
+            Write-Host "Retrieving secret value from Vault for $awsSecretName ..."
+            $secretValueResponse = Invoke-RestMethod -Method GET -Uri $vaultDataUri -Headers $vaultHeaders
+            # Assuming the secret data is in $secretValueResponse.data.data, convert it to a compact JSON string.
+            $secretValue = $secretValueResponse.data.data | ConvertTo-Json -Compress
         }
-        else {
-            $mounts = $mountsResponse
+        catch {
+            Write-Warning "Failed to retrieve secret value for '$awsSecretName'. Skipping this secret. Error details: $($_.Exception.Message)"
+            continue
         }
-        foreach ($mountProperty in $mounts.PSObject.Properties) {
-            try {
-                $mountPath = $mountProperty.Name.TrimEnd("/")
-                $mountType = $mountProperty.Value.type
-                Write-Host "Writing secret mount record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
-                $records += [pscustomobject]@{
-                    Namespace = $ns
-                    MountPath = $mountPath
-                    MountType = $mountType
-                }
-            }
-            catch {
-                Write-Host "Error processing secret mount property '$($mountProperty.Name)': $_" -ForegroundColor Red
-            }
+        
+        # Create the secret in AWS Secrets Manager.
+        try {
+            Write-Host "Creating AWS secret '$awsSecretName' ..."
+            New-SECSecret -Name $awsSecretName -SecretString $secretValue -Region $awsRegion -Force -ErrorAction Stop
+            Write-Host "Secret '$awsSecretName' created successfully in AWS Secrets Manager."
         }
-    }
-    catch {
-        Write-Host "Error retrieving secret mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
-    }
-
-    # Retrieve auth mounts
-    $authUri = "$vaultUrl/v1/sys/auth"
-    try {
-        $authResponse = Invoke-RestMethod -Method Get -Uri $authUri -Headers $nsHeaders -ErrorAction Stop
-        if ($authResponse.data) {
-            $authMounts = $authResponse.data
+        catch {
+            Write-Error "Error creating AWS secret '$awsSecretName'. Detailed error: $($_.Exception.Message)"
         }
-        else {
-            $authMounts = $authResponse
-        }
-        foreach ($authProperty in $authMounts.PSObject.Properties) {
-            try {
-                $mountPath = $authProperty.Name.TrimEnd("/")
-                $mountType = $authProperty.Value.type
-                Write-Host "Writing auth mount record - Namespace: $ns, Mount: $mountPath, Type: $mountType" -ForegroundColor Yellow
-                $records += [pscustomobject]@{
-                    Namespace = $ns
-                    MountPath = $mountPath
-                    MountType = $mountType
-                }
-            }
-            catch {
-                Write-Host "Error processing auth mount property '$($authProperty.Name)': $_" -ForegroundColor Red
-            }
-        }
-    }
-    catch {
-        Write-Host "Error retrieving auth mounts for namespace '$ns'. Error: $_" -ForegroundColor Red
     }
 }
 
-# ----- Step 6: Export the Data to CSV -----
-# Create a timestamp
-$timestamp = Get-Date -Format "yyyyMMddHHmmss"
-
-# Extract the hostname portion from the vaultUrl
-$hostName = ([Uri]$vaultUrl).Host
-
-# Construct output file name as {timestamp}-{target-url}-mounts.csv
-$outputCsv = "$timestamp-$hostName-mounts.csv"
-try {
-    $records | Export-Csv -Path $outputCsv -NoTypeInformation -ErrorAction Stop
-    Write-Host "CSV file generated: $outputCsv" -ForegroundColor Cyan
-}
-catch {
-    Write-Host "Error exporting CSV file: $_" -ForegroundColor Red
-}
+Write-Host "`nAll secrets processed."
